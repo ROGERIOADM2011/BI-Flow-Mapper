@@ -411,6 +411,8 @@ const state = {
 
 const els = {
   input: document.getElementById("pbixInput"),
+  pbipInput: document.getElementById("pbipInput"),
+  pbipButton: document.getElementById("pbipButton"),
   demoButton: document.getElementById("demoButton"),
   pbixButton: document.getElementById("pbixButton"),
   exportButton: document.getElementById("exportButton"),
@@ -466,6 +468,14 @@ function bindEvents() {
     const file = event.target.files[0];
     if (!file) return;
     await loadPbix(file);
+  });
+
+  els.pbipButton.addEventListener("click", () => els.pbipInput.click());
+  els.pbipInput.addEventListener("change", async (event) => {
+    const files = event.target.files;
+    if (!files || !files.length) return;
+    await loadPbipProject(files);
+    event.target.value = "";
   });
 
   els.demoButton.addEventListener("click", loadDemo);
@@ -532,6 +542,7 @@ function renderFilters() {
 async function loadPbix(file) {
   setSubtitle(t().loadingAnalysing(file.name));
   state.lastPbixFile = file;
+  state.pbipFiles = null;   // saindo do fluxo .pbip
   els.exportDocxButton.disabled = false;
   const backendGraph = await analyzeWithBackend(file);
   if (backendGraph) {
@@ -563,6 +574,71 @@ async function loadPbix(file) {
   } catch (error) {
     console.error(error);
     setSubtitle(t().loadingError);
+  }
+}
+
+async function loadPbipProject(fileList) {
+  // Lê um projeto .pbip nativamente: envia só os arquivos de definition/
+  // (TMDL do modelo + PBIR do relatório) ao backend, que monta o grafo completo
+  // incluindo páginas e visuais — algo que o .pbix originado de .pbip não traz.
+  const T = t();
+  const all = Array.from(fileList);
+  const wanted = all.filter((file) => {
+    const path = (file.webkitRelativePath || file.name).toLowerCase();
+    return path.includes(".semanticmodel/definition/") || path.includes(".report/definition/");
+  });
+
+  if (!wanted.length) {
+    alert(
+      "Pasta sem modelo .pbip. Selecione a pasta do projeto que contém as subpastas " +
+      "'<nome>.SemanticModel' e '<nome>.Report'."
+    );
+    return;
+  }
+
+  // Deriva o nome do projeto a partir da pasta .SemanticModel.
+  let projectName = "projeto.pbip";
+  const semanticFile = wanted.find((file) =>
+    file.webkitRelativePath.toLowerCase().includes(".semanticmodel/")
+  );
+  if (semanticFile) {
+    const segment = semanticFile.webkitRelativePath
+      .split("/")
+      .find((part) => part.toLowerCase().endsWith(".semanticmodel"));
+    if (segment) projectName = segment.replace(/\.SemanticModel$/i, ".pbip");
+  }
+
+  setSubtitle(typeof T.loadingAnalysing === "function" ? T.loadingAnalysing(projectName) : "Analisando projeto .pbip...");
+
+  const form = new FormData();
+  for (const file of wanted) form.append("files", file, file.webkitRelativePath);
+
+  try {
+    const response = await fetch("/api/analyze-files", {
+      method: "POST",
+      headers: { "X-BIFM-Name": encodeURIComponent(projectName) },
+      body: form,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+    const graph = await response.json();
+
+    state.relationships = graph.relationships || [];
+    state.pages         = graph.pages || [];
+    state.architecture  = buildArchitectureData(graph);
+    state.pbipFiles     = wanted;        // guardados para reuso no export Word
+    state.pbipName      = projectName;
+    state.lastPbixFile  = null;          // não há binário .pbix neste fluxo
+    els.exportDocxButton.disabled = false;
+
+    rememberPbix(graph, graph.fileName || projectName, "");
+    setGraph(graph, graph.fileName || projectName, "");
+  } catch (error) {
+    console.error(error);
+    setSubtitle(T.loadingError || "Erro ao analisar o projeto.");
+    alert("Falha ao ler o projeto .pbip: " + error.message);
   }
 }
 
@@ -2170,7 +2246,8 @@ function exportGraph() {
 
 async function exportDocumentation() {
   const T = t();
-  if (!state.lastPbixFile) {
+  const isPbip = Array.isArray(state.pbipFiles) && state.pbipFiles.length > 0;
+  if (!state.lastPbixFile && !isPbip) {
     alert(T.docxNoPbix);
     return;
   }
@@ -2180,14 +2257,23 @@ async function exportDocumentation() {
   els.exportDocxButton.disabled = true;
   buttonText.textContent = T.docxGenerating;
 
+  // Projeto .pbip: reenvia os arquivos de definition para documentar nativamente.
+  // Binário .pbix: envia o arquivo via pbixray, como antes.
+  const baseName = isPbip ? state.pbipName : state.lastPbixFile.name;
   const form = new FormData();
-  form.append("pbix", state.lastPbixFile, state.lastPbixFile.name);
+  const endpoint = isPbip ? "/api/export-docx-files" : "/api/export-docx";
+  if (isPbip) {
+    for (const file of state.pbipFiles) form.append("files", file, file.webkitRelativePath);
+  } else {
+    form.append("pbix", state.lastPbixFile, state.lastPbixFile.name);
+  }
 
   try {
-    const response = await fetch("/api/export-docx", {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: {
-        "X-BIFM-Locale": locale
+        "X-BIFM-Locale": locale,
+        "X-BIFM-Name": encodeURIComponent(baseName || "projeto.pbip")
       },
       body: form
     });
@@ -2199,7 +2285,7 @@ async function exportDocumentation() {
     const blob = await response.blob();
     const suggestedName =
       filenameFromDisposition(response.headers.get("Content-Disposition")) ||
-      `${slug(state.lastPbixFile.name.replace(/\.[^.]+$/, ""))}_${locale === "pt-BR" ? "documentacao" : "documentation"}.docx`;
+      `${slug((baseName || "power-bi").replace(/\.[^.]+$/, ""))}_${locale === "pt-BR" ? "documentacao" : "documentation"}.docx`;
 
     // pywebview blocks link.click() — use the Python bridge when available
     if (window.pywebview && window.pywebview.api && window.pywebview.api.save_file) {

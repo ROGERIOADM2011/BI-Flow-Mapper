@@ -200,8 +200,25 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed_url = urlparse(self.path)
         request_path = parsed_url.path
-        if request_path not in {"/api/analyze", "/api/export-docx"}:
+        if request_path not in {
+            "/api/analyze",
+            "/api/analyze-path",
+            "/api/analyze-files",
+            "/api/export-docx",
+            "/api/export-docx-files",
+        }:
             self.send_json({"error": "Not found"}, status=404)
+            return
+
+        # Modo local: analisa um arquivo/projeto pelo caminho no disco. Permite
+        # ler um projeto .pbip (pasta) sem precisar zipar ou subir 90+ MB.
+        if request_path == "/api/analyze-path":
+            self.handle_analyze_path()
+            return
+
+        # Projeto .pbip via folder picker: vários arquivos de definition enviados.
+        if request_path in {"/api/analyze-files", "/api/export-docx-files"}:
+            self.handle_pbip_files(request_path, parsed_url)
             return
 
         try:
@@ -214,7 +231,16 @@ class Handler(SimpleHTTPRequestHandler):
                 if request_path == "/api/export-docx":
                     locale = self.headers.get("X-BIFM-Locale") or parse_qs(parsed_url.query).get("locale", ["pt-BR"])[0]
                     doc_locale = normalize_doc_locale(locale)
-                    data = build_documentation_docx(pbix_path, file_name, doc_locale)
+                    # Um .zip de projeto .pbip é extraído e documentado nativamente.
+                    if pbix_path.suffix.lower() == ".zip" and zip_is_pbip_project(pbix_path):
+                        extract_dir = Path(temp_dir) / "pbip_extract"
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(pbix_path) as archive:
+                            archive.extractall(extract_dir)
+                        doc_target = _find_pbip_root(extract_dir)
+                    else:
+                        doc_target = pbix_path
+                    data = build_documentation_docx(doc_target, file_name, doc_locale)
                     suffix = "documentacao" if doc_locale == "pt-BR" else "documentation"
                     docx_name = f"{Path(file_name or 'power-bi').stem}_{suffix}.docx"
                     self.send_binary(
@@ -224,8 +250,77 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     return
 
-                graph = analyze_pbix(pbix_path)
+                # Um .zip pode conter um projeto .pbip (modelo TMDL + relatório PBIR).
+                if pbix_path.suffix.lower() == ".zip" and zip_is_pbip_project(pbix_path):
+                    graph = analyze_project_zip(pbix_path, Path(temp_dir))
+                else:
+                    graph = analyze_pbix(pbix_path)
                 graph["fileName"] = file_name
+                self.send_json(graph)
+        except Exception as error:
+            traceback.print_exc()
+            self.send_json({"error": str(error)}, status=500)
+
+    def handle_analyze_path(self):
+        """Analisa um arquivo/projeto a partir de um caminho local (JSON ``{path}``).
+
+        Detecta automaticamente ``.pbip`` (projeto/pasta) ou ``.pbix`` (binário) e
+        delega para o analisador correto. Restrito a ``127.0.0.1`` (servidor local).
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(body.decode("utf-8") or "{}")
+            raw_path = (payload.get("path") or "").strip().strip('"')
+            if not raw_path:
+                self.send_json({"error": "Campo 'path' ausente."}, status=400)
+                return
+
+            target = Path(raw_path)
+            if not target.exists():
+                self.send_json({"error": f"Caminho não encontrado: {raw_path}"}, status=404)
+                return
+
+            import pbip_reader
+
+            if pbip_reader.is_pbip(target):
+                graph = analyze_pbip(target)
+            else:
+                graph = analyze_pbix(target)
+            graph["fileName"] = target.name
+            self.send_json(graph)
+        except Exception as error:
+            traceback.print_exc()
+            self.send_json({"error": str(error)}, status=500)
+
+    def handle_pbip_files(self, request_path, parsed_url):
+        """Recebe os arquivos de um projeto .pbip (folder picker) e analisa/documenta.
+
+        O frontend envia apenas os arquivos de ``definition/`` (TMDL e PBIR), que
+        são reconstruídos num diretório temporário e lidos por ``analyze_pbip`` /
+        ``build_documentation_docx``.
+        """
+        try:
+            files = self.read_multipart_files()
+            file_label = unquote(self.headers.get("X-BIFM-Name") or "projeto.pbip")
+            with tempfile.TemporaryDirectory(prefix="bi-flow-mapper-pbip-") as temp_dir:
+                project_dir = reconstruct_pbip_dir(files, Path(temp_dir))
+
+                if request_path == "/api/export-docx-files":
+                    locale = self.headers.get("X-BIFM-Locale") or parse_qs(parsed_url.query).get("locale", ["pt-BR"])[0]
+                    doc_locale = normalize_doc_locale(locale)
+                    data = build_documentation_docx(project_dir, file_label, doc_locale)
+                    suffix = "documentacao" if doc_locale == "pt-BR" else "documentation"
+                    docx_name = f"{Path(file_label).stem}_{suffix}.docx"
+                    self.send_binary(
+                        data,
+                        docx_name,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                    return
+
+                graph = analyze_pbip(project_dir)
+                graph["fileName"] = file_label
                 self.send_json(graph)
         except Exception as error:
             traceback.print_exc()
@@ -264,6 +359,44 @@ class Handler(SimpleHTTPRequestHandler):
             return filename, payload
 
         raise ValueError("Campo de upload 'pbix' nao encontrado.")
+
+    def read_multipart_files(self):
+        """Lê todas as partes de arquivo de um multipart, preservando o caminho relativo.
+
+        Usado pelo fluxo de projeto ``.pbip`` (folder picker), em que cada arquivo
+        de ``definition/`` é enviado com seu ``webkitRelativePath`` no ``filename``.
+
+        Returns:
+            Lista de tuplas ``(relative_path, bytes)``.
+        """
+        content_type = self.headers.get("Content-Type", "")
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+
+        boundary_match = re.search(r"boundary=([^;]+)", content_type)
+        if not boundary_match:
+            raise ValueError("Upload multipart sem boundary.")
+
+        boundary = ("--" + boundary_match.group(1).strip('"')).encode()
+        files = []
+        for part in body.split(boundary):
+            if b"\r\n\r\n" not in part:
+                continue
+            headers, payload = part.split(b"\r\n\r\n", 1)
+            filename_match = re.search(rb'filename="([^"]*)"', headers)
+            if not filename_match:
+                continue
+            filename = unquote(filename_match.group(1).decode("utf-8", errors="replace"))
+            if not filename:
+                continue
+            payload = payload.rstrip(b"\r\n")
+            if payload.endswith(b"--"):
+                payload = payload[:-2].rstrip(b"\r\n")
+            files.append((filename, payload))
+
+        if not files:
+            raise ValueError("Nenhum arquivo recebido no upload do projeto.")
+        return files
 
     def send_json(self, payload, status=200):
         data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -309,7 +442,65 @@ def analyze_pbix(path: Path):
     semantic_tables = records_from(model, "tmschema_tables", diagnostics)
     tables = list_from(model, "tables", diagnostics)
     visuals = extract_visuals_from_layout(path)
+    pages = extract_pages_from_layout(path)
 
+    return assemble_graph(
+        power_query=power_query,
+        datasource_records=datasource_records,
+        measures=measures,
+        calc_columns_raw=calc_columns_raw,
+        relationships=relationships,
+        schema=schema,
+        semantic_tables=semantic_tables,
+        tables=tables,
+        visuals=visuals,
+        pages=pages,
+        diagnostics=diagnostics,
+        source_label="pbixray",
+        file_label=path.name,
+    )
+
+
+def assemble_graph(
+    power_query,
+    datasource_records,
+    measures,
+    calc_columns_raw,
+    relationships,
+    schema,
+    semantic_tables,
+    tables,
+    visuals,
+    pages,
+    diagnostics,
+    source_label="pbixray",
+    file_label="",
+):
+    """Monta o grafo de linhagem a partir de conjuntos de registros já extraídos.
+
+    Compartilhada entre ``analyze_pbix`` (registros do pbixray sobre um ``.pbix``)
+    e ``analyze_pbip`` (registros TMDL/PBIR de um projeto ``.pbip``), garantindo
+    saída idêntica para o frontend independente da fonte.
+
+    Args:
+        power_query: registros de consultas M (``TableName``/``Expression``).
+        datasource_records: fontes de dados explícitas (pode ser vazio).
+        measures: registros de medidas DAX.
+        calc_columns_raw: registros de colunas (calculadas têm ``Expression``).
+        relationships: registros de relacionamentos do modelo.
+        schema: registros de colunas (``TableName``/``ColumnName``).
+        semantic_tables: registros de tabelas (``Name``/``IsHidden``).
+        tables: lista de nomes de tabelas.
+        visuals: visuais ``{name, type, refs}`` inferidos do relatório.
+        pages: páginas ``{name, ordinal, visualCount, width, height}``.
+        diagnostics: lista mutável de mensagens de diagnóstico.
+        source_label: rótulo de origem (``pbixray`` ou ``pbip-tmdl``).
+        file_label: nome do arquivo/projeto para o nó de fallback.
+
+    Returns:
+        dict com ``nodes``, ``edges``, ``warnings``, ``source``,
+        ``relationships`` e ``pages``.
+    """
     connector_nodes = detect_connector_nodes(power_query, datasource_records)
     query_nodes = build_query_nodes(power_query, connector_nodes)
     table_nodes = build_table_nodes(tables, schema, semantic_tables, query_nodes)
@@ -360,9 +551,9 @@ def analyze_pbix(path: Path):
         nodes.append({
             "id": "file:pbix",
             "type": "source",
-            "label": path.name,
+            "label": file_label or "model",
             "icon": "PBX",
-            "meta": {"expression": "\n".join(diagnostics) or "PBIXRay nao retornou metadados."},
+            "meta": {"expression": "\n".join(diagnostics) or "Nenhum metadado retornado."},
         })
 
     diagnostics.append(f"Power Query rows: {len(power_query)}")
@@ -376,16 +567,109 @@ def analyze_pbix(path: Path):
 
     structured_rels = build_structured_relationships(relationships)
 
-    pages = extract_pages_from_layout(path)
-
     return {
         "nodes": nodes,
         "edges": unique_edges(edges),
         "warnings": diagnostics,
-        "source": "pbixray",
+        "source": source_label,
         "relationships": structured_rels,
         "pages": pages,
     }
+
+
+def analyze_pbip(path):
+    """Analisa um projeto Power BI (.pbip) lendo TMDL + PBIR nativamente.
+
+    Não depende de pbixray nem do ``.pbix`` binário: lê a fonte versionada
+    (modelo em TMDL, relatório em PBIR) e produz o mesmo grafo via
+    ``assemble_graph``. Recupera, inclusive, páginas e visuais (que o pbixray
+    não enxerga em arquivos originados de ``.pbip``).
+
+    Args:
+        path: caminho do arquivo ``.pbip`` ou da pasta do projeto.
+
+    Returns:
+        dict do grafo (mesma forma de ``analyze_pbix``).
+    """
+    import pbip_reader  # import tardio evita acoplamento/ciclo no carregamento
+
+    record = pbip_reader.read_project(Path(path))
+    return assemble_graph(
+        power_query=record["power_query"],
+        datasource_records=[],
+        measures=record["measures"],
+        calc_columns_raw=record["calc_columns"],
+        relationships=record["relationships"],
+        schema=record["schema"],
+        semantic_tables=record["semantic_tables"],
+        tables=record["tables"],
+        visuals=record["visuals"],
+        pages=record["pages"],
+        diagnostics=record["diagnostics"],
+        source_label="pbip-tmdl",
+        file_label=Path(path).name,
+    )
+
+
+def zip_is_pbip_project(path: Path) -> bool:
+    """Indica se um ``.zip`` carregado contém um projeto ``.pbip`` (modelo TMDL)."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                lowered = name.lower()
+                if ".semanticmodel/definition/" in lowered and lowered.endswith(".tmdl"):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _find_pbip_root(base_dir: Path) -> Path:
+    """Procura, dentro de ``base_dir``, a pasta que contém um projeto ``.pbip``."""
+    import pbip_reader
+
+    candidates = [base_dir, *[p for p in base_dir.rglob("*") if p.is_dir()]]
+    for candidate in candidates:
+        if pbip_reader.is_pbip(candidate):
+            return candidate
+    raise FileNotFoundError("Projeto .pbip (modelo TMDL) não encontrado.")
+
+
+def analyze_project_zip(zip_path: Path, work_dir: Path):
+    """Extrai um ``.zip`` de projeto ``.pbip`` e o analisa via ``analyze_pbip``."""
+    extract_dir = work_dir / "pbip_extract"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(extract_dir)
+    return analyze_pbip(_find_pbip_root(extract_dir))
+
+
+def reconstruct_pbip_dir(files, work_dir: Path) -> Path:
+    """Grava arquivos (caminho relativo, bytes) num diretório e acha a raiz do projeto.
+
+    Args:
+        files: lista de tuplas ``(relative_path, bytes)`` vindas do folder picker.
+        work_dir: diretório temporário onde reconstruir a árvore.
+
+    Returns:
+        Caminho da pasta que contém o projeto ``.pbip`` (modelo TMDL).
+
+    Raises:
+        FileNotFoundError: se nenhum projeto ``.pbip`` for encontrado.
+    """
+    base = work_dir / "pbip_files"
+    base.mkdir(parents=True, exist_ok=True)
+    for relative_path, payload in files:
+        # Normaliza separadores e impede travessia de diretório (path traversal).
+        normalized = relative_path.replace("\\", "/").lstrip("/")
+        parts = [p for p in normalized.split("/") if p not in ("", ".", "..")]
+        if not parts:
+            continue
+        target = base.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+    return _find_pbip_root(base)
 
 
 def svg_to_png_bytes(svg_string: str, scale: float = 2.0) -> bytes | None:
@@ -1228,25 +1512,41 @@ def doc_text(locale: str = ""):
 
 
 def build_documentation_docx(path: Path, file_name: str = "", locale: str = "pt-BR") -> bytes:
-    if not load_pbixray():
-        raise RuntimeError(f"pbixray nao esta instalado ou nao carregou: {PBIXRAY_IMPORT_ERROR}")
     if not load_docx():
         raise RuntimeError(f"python-docx nao esta instalado ou nao carregou: {DOCX_IMPORT_ERROR}")
     load_pillow()
 
+    import pbip_reader  # detecta projeto .pbip vs binário .pbix
+
     doc_labels = doc_text(locale)
     metric_labels = doc_labels["metrics"]
     diagnostics = []
-    model = PBIXRay(str(path))
-    graph = analyze_pbix(path)
 
-    power_query = records_from(model, "power_query", diagnostics)
-    datasource_records = records_from(model, "tmschema_datasources", diagnostics)
-    measures = records_from(model, "dax_measures", diagnostics)
-    calc_columns = records_from(model, "dax_columns", diagnostics)
-    schema = records_from(model, "schema", diagnostics)
-    semantic_tables = records_from(model, "tmschema_tables", diagnostics)
-    tmschema_columns = records_from(model, "tmschema_columns", diagnostics)
+    if pbip_reader.is_pbip(path):
+        # Fonte da verdade versionada: modelo TMDL + relatório PBIR.
+        record = pbip_reader.read_project(Path(path))
+        graph = analyze_pbip(path)
+        power_query = record["power_query"]
+        datasource_records = []
+        measures = record["measures"]
+        calc_columns = record["calc_columns"]
+        schema = record["schema"]
+        semantic_tables = record["semantic_tables"]
+        tmschema_columns = []
+        analysis_source = "BI Flow Mapper (.pbip TMDL/PBIR)"
+    else:
+        if not load_pbixray():
+            raise RuntimeError(f"pbixray nao esta instalado ou nao carregou: {PBIXRAY_IMPORT_ERROR}")
+        model = PBIXRay(str(path))
+        graph = analyze_pbix(path)
+        power_query = records_from(model, "power_query", diagnostics)
+        datasource_records = records_from(model, "tmschema_datasources", diagnostics)
+        measures = records_from(model, "dax_measures", diagnostics)
+        calc_columns = records_from(model, "dax_columns", diagnostics)
+        schema = records_from(model, "schema", diagnostics)
+        semantic_tables = records_from(model, "tmschema_tables", diagnostics)
+        tmschema_columns = records_from(model, "tmschema_columns", diagnostics)
+        analysis_source = "PBIXRay"
 
     nodes = graph.get("nodes", [])
     edges = graph.get("edges", [])
@@ -1284,7 +1584,7 @@ def build_documentation_docx(path: Path, file_name: str = "", locale: str = "pt-
     add_key_value_table(doc, [
         (doc_labels["file"], file_name or path.name),
         (doc_labels["generated_at"], datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
-        (doc_labels["analysis_source"], "PBIXRay"),
+        (doc_labels["analysis_source"], analysis_source),
         (doc_labels["total_nodes"], len(nodes)),
         (doc_labels["total_edges"], len(edges)),
     ])
