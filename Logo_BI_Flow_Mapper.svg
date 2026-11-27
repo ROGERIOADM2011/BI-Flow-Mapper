@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <!-- Neutral BI Flow Mapper logo -->
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0078D4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#50A8F5;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="90" fill="url(#grad1)"/>
+  
+  <!-- Flow arrows representing data flow -->
+  <g fill="#FFFFFF">
+    <!-- Source node -->
+    <circle cx="60" cy="80" r="8"/>
+    
+    <!-- Middle nodes -->
+    <circle cx="100" cy="70" r="8"/>
+    <circle cx="100" cy="100" r="8"/>
+    <circle cx="100" cy="130" r="8"/>
+    
+    <!-- Target node -->
+    <circle cx="140" cy="100" r="8"/>
+    
+    <!-- Connection lines -->
+    <line x1="68" y1="80" x2="92" y2="72" stroke="#FFFFFF" stroke-width="3"/>
+    <line x1="68" y1="80" x2="92" y2="98" stroke="#FFFFFF" stroke-width="3"/>
+    <line x1="68" y1="80" x2="92" y2="128" stroke="#FFFFFF" stroke-width="3"/>
+    
+    <line x1="108" y1="70" x2="132" y2="95" stroke="#FFFFFF" stroke-width="3"/>
+    <line x1="108" y1="100" x2="132" y2="100" stroke="#FFFFFF" stroke-width="3"/>
+    <line x1="108" y1="130" x2="132" y2="105" stroke="#FFFFFF" stroke-width="3"/>
+  </g>
+</svg>
