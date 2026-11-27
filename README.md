@@ -6,7 +6,7 @@
 
 BI Flow Mapper reads a `.pbix` file and draws the full pipeline from data sources through Power Query, model tables, DAX measures, calculated columns and report visuals — with impact analysis, relationship diagrams, architecture overview, pages inventory, and Word documentation export.
 
-> **Fork e atribuição** — Este repositório é um fork do projeto original [**BI Flow Mapper** de JoseMalan](https://github.com/JoseMalan/BI-Flow-Mapper) (licença MIT), estendido por **Rogério Alves Rocha de Souza**. A principal contribuição deste fork é o **leitor nativo de projetos `.pbip` (TMDL + PBIR)**: lê o modelo semântico em TMDL e o relatório em PBIR diretamente da fonte versionada, recuperando páginas e visuais que um `.pbix` exportado de um projeto `.pbip` não carrega. Inclui também os endpoints e o botão de UI correspondentes, o export Word para `.pbip` e o branding Cereal Ouro. Créditos do projeto base permanecem com o autor original; veja [`LICENSE`](LICENSE).
+> **Fork and attribution** — This repository is a fork of the original [**BI Flow Mapper** by JoseMalan](https://github.com/JoseMalan/BI-Flow-Mapper) (MIT license), extended by **Rogério Alves Rocha de Souza** (GitHub: ROGERIOADM2011). The main contribution of this fork is the **native `.pbip` project reader (TMDL + PBIR)**: it reads the semantic model in TMDL and the report in PBIR directly from the versioned source, recovering pages and visuals that a `.pbix` exported from a `.pbip` project doesn't load. Also includes the corresponding endpoints and UI button, plus Word export for `.pbip` projects. Credits for the base project remain with the original author; see [`LICENSE`](LICENSE).
 
 ## 🎥 Video Demo
 
